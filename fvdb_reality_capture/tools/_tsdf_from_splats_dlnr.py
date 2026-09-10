@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 import pathlib
-import tempfile
 
 import numpy as np
 import torch
 import tqdm
+from PIL import Image
 from fvdb import Grid
 from fvdb.types import NumericMaxRank2, NumericMaxRank3
 
@@ -109,9 +109,10 @@ class TSDFInputDataset(torch.utils.data.Dataset):
         far: float,
         reprojection_threshold: float,
         alpha_threshold: float,
-        dlnr_model: DLNRModel,
+        dlnr_model: DLNRModel | None,
         use_absolute_baseline: bool,
         show_progress: bool,
+        fusion_foreground_mask_paths: list[str | None] | None = None,
     ):
         """
         Create a TSDFInputDataset by precomputing and caching the RGB images, depths, and weights for TSDF fusion.
@@ -132,9 +133,13 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             reprojection_threshold (float): Reprojection error threshold for occlusion masking in pixels.
             alpha_threshold (float): Alpha threshold to mask pixels where the Gaussian splat model is transparent
                 (usually indicating the background).
-            dlnr_model (DLNRModel): The DLNR model to compute optical flow and disparity.
+            dlnr_model (DLNRModel | None): The DLNR model to compute optical flow and disparity. May be
+                None only when the cache already holds rgb/depth/weight for every view, in which case
+                no inference is needed.
             use_absolute_baseline (bool): If True, use the provided baseline as an absolute distance in world units.
             show_progress (bool): Whether to show a progress bar (default is True).
+            fusion_foreground_mask_paths (list[str | None] | None): Optional per-view mask paths used for
+                streaming foreground gating. Each entry is either a mask image path or None.
         """
         if not cache_path.exists():
             cache_path.mkdir(parents=True, exist_ok=True)
@@ -149,6 +154,7 @@ class TSDFInputDataset(torch.utils.data.Dataset):
         self.reprojection_threshold = reprojection_threshold
         self.alpha_threshold = alpha_threshold
         self.dlnr_model = dlnr_model
+        self.fusion_foreground_mask_paths = fusion_foreground_mask_paths
         self.camera_models = (
             camera_models
             if camera_models is not None
@@ -160,6 +166,12 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             else torch.zeros((self.num_images, 12), dtype=torch.float32)
         )
 
+        if self.fusion_foreground_mask_paths is not None and len(self.fusion_foreground_mask_paths) != self.num_images:
+            raise ValueError(
+                "fusion_foreground_mask_paths length mismatch: "
+                f"expected {self.num_images}, got {len(self.fusion_foreground_mask_paths)}"
+            )
+
         device = model.device
 
         enumerator = (
@@ -168,7 +180,31 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             else range(self.num_images)
         )
 
+        def _cache_has_all_required_for_view(view_idx: int) -> bool:
+            required = [f"rgb_{view_idx}", f"depth_{view_idx}", f"weight_{view_idx}"]
+            for key in required:
+                try:
+                    self.cache.read_file(key)
+                except (FileNotFoundError, ValueError):
+                    return False
+            return True
+
+        reused_count = 0
+        generated_count = 0
+
         for i in enumerator:
+            # Skip views already present in the cache so a re-run (e.g. re-meshing at different TSDF
+            # settings) does not redo DLNR inference, which dominates wall-clock time.
+            if _cache_has_all_required_for_view(i):
+                reused_count += 1
+                continue
+
+            if self.dlnr_model is None:
+                raise RuntimeError(
+                    "Missing cached TSDF inputs and DLNR model is not available. "
+                    "Provide dlnr_model or ensure cache contains rgb/depth/weight for all views."
+                )
+
             cam_to_world_matrix = camera_to_world_matrices[i].to(dtype=torch.float32, device=device)
             world_to_cam_matrix = (
                 torch.linalg.inv(cam_to_world_matrix).contiguous().to(dtype=torch.float32, device=device)
@@ -178,7 +214,6 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             distortion_coeffs_i = self.distortion_coeffs[i].to(dtype=torch.float32, device=device)
             image_height, image_width = int(image_sizes[i][0].item()), int(image_sizes[i][1].item())
 
-            # debug_img_name = f"debug_image_{i:04d}.png"
             rgb_image, depth_image, weight_image = self.extract_single_tsdf_input(
                 world_to_cam_matrix=world_to_cam_matrix,
                 projection_matrix=projection_matrix,
@@ -186,12 +221,22 @@ class TSDFInputDataset(torch.utils.data.Dataset):
                 distortion_coeffs=distortion_coeffs_i,
                 image_width=image_width,
                 image_height=image_height,
+                fusion_foreground_mask=None,
                 save_debug_images_to=None,  # Set to a path if you want to save debug images
             )
 
             self.cache.write_file(f"rgb_{i}", rgb_image.cpu().numpy(), data_type="npy")
             self.cache.write_file(f"depth_{i}", depth_image.cpu().numpy(), data_type="npy")
             self.cache.write_file(f"weight_{i}", weight_image.cpu().numpy(), data_type="npy")
+
+            generated_count += 1
+
+        if reused_count > 0:
+            print(
+                "Reused cached TSDF inputs: "
+                f"{reused_count}/{self.num_images} views "
+                f"(generated {generated_count} missing views)."
+            )
 
     def extract_single_tsdf_input(
         self,
@@ -201,6 +246,7 @@ class TSDFInputDataset(torch.utils.data.Dataset):
         distortion_coeffs: torch.Tensor,
         image_width: int,
         image_height: int,
+        fusion_foreground_mask: torch.Tensor | None = None,
         save_debug_images_to: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -278,6 +324,23 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             weights = near_far_mask & occlusion_mask & alpha_mask
         else:
             weights = near_far_mask & occlusion_mask
+
+        if fusion_foreground_mask is not None:
+            fg_mask = fusion_foreground_mask
+            if fg_mask.dim() == 3 and fg_mask.shape[0] == 1:
+                fg_mask = fg_mask[0]
+            if fg_mask.dim() != 2:
+                raise ValueError(
+                    f"Expected fusion_foreground_mask to have shape (H, W) or (1, H, W), got {tuple(fg_mask.shape)}"
+                )
+            fg_mask = fg_mask.to(device=weights.device)
+            if fg_mask.dtype != torch.bool:
+                fg_mask = fg_mask > 0.5
+            if fg_mask.shape != weights.shape:
+                raise ValueError(
+                    f"fusion_foreground_mask shape {tuple(fg_mask.shape)} does not match weights shape {tuple(weights.shape)}"
+                )
+            weights = weights & fg_mask
 
         if save_debug_images_to is not None:
             debug_plot(
@@ -477,11 +540,50 @@ class TSDFInputDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_images
 
+    def _load_fusion_foreground_mask_for_idx(self, idx: int, image_height: int, image_width: int) -> torch.Tensor | None:
+        """
+        Load the foreground mask for a single view, or None when this view has no mask.
+
+        A mask that fails to load is treated as "no gating" rather than an error: losing background
+        suppression for one view degrades that view's contribution, whereas aborting would throw away
+        an entire (expensive) TSDF run.
+        """
+        if self.fusion_foreground_mask_paths is None:
+            return None
+
+        mask_path = self.fusion_foreground_mask_paths[idx]
+        if mask_path is None or len(mask_path) == 0:
+            return None
+
+        try:
+            with Image.open(mask_path) as mask_img:
+                mask_arr = np.asarray(mask_img.convert("L"), dtype=np.uint8)
+            if mask_arr.shape != (image_height, image_width):
+                raise ValueError(f"expected {(image_height, image_width)} got {tuple(mask_arr.shape)}")
+            return torch.from_numpy(mask_arr > 127)
+        except Exception as e:
+            print(f"WARNING: Failed to load foreground mask {mask_path}: {e}. Using all pixels for this view.")
+            return None
+
     def __getitem__(self, idx):
         _, rgb = self.cache.read_file(f"rgb_{idx}")
         _, depth = self.cache.read_file(f"depth_{idx}")
         _, weight = self.cache.read_file(f"weight_{idx}")
-        return torch.from_numpy(rgb), torch.from_numpy(depth), torch.from_numpy(weight)
+
+        rgb_t = torch.from_numpy(rgb) if not torch.is_tensor(rgb) else rgb
+        depth_t = torch.from_numpy(depth) if not torch.is_tensor(depth) else depth
+        weight_t = torch.from_numpy(weight) if not torch.is_tensor(weight) else weight
+
+        # Masks gate the per-pixel fusion weights, so background pixels never allocate voxels.
+        # Applied here rather than at generation time so a cached run can be re-fused with
+        # different masks without redoing DLNR inference.
+        if self.fusion_foreground_mask_paths is not None:
+            image_height, image_width = weight_t.shape[-2], weight_t.shape[-1]
+            fusion_foreground_mask = self._load_fusion_foreground_mask_for_idx(idx, image_height, image_width)
+            if fusion_foreground_mask is not None:
+                weight_t = weight_t & fusion_foreground_mask.to(device=weight_t.device)
+
+        return rgb_t, depth_t, weight_t
 
 
 @torch.no_grad()
@@ -506,6 +608,8 @@ def tsdf_from_splats_dlnr(
     use_absolute_baseline: bool = False,
     show_progress: bool = True,
     num_workers: int = 8,
+    dlnr_cache_path: str | pathlib.Path | None = None,
+    fusion_foreground_mask_paths: list[str | None] | None = None,
 ) -> tuple[Grid, torch.Tensor, torch.Tensor]:
     """
     Extract a Truncated Signed Distance Field (TSDF) from a `fvdb_reality_capture.GaussianSplat3d` using TSDF fusion from depth maps
@@ -595,6 +699,13 @@ def tsdf_from_splats_dlnr(
             Gaussian splat radiance field. Default is ``False``.
         show_progress (bool): Whether to show a progress bar during processing. Default is ``True``.
         num_workers (int): Number of workers to use for loading data generated by DLNR. Default is 8.
+        dlnr_cache_path (str | pathlib.Path | None): Optional cache directory for intermediate DLNR TSDF
+            inputs (depth, RGB, weights). If ``None``, defaults to ``/workspace/tsdf_dlnr_cache``. When the
+            cache already holds every view, DLNR inference is skipped entirely. The cache is keyed only by
+            this path, so pass a per-dataset directory - a shared path silently reuses one scene's depths
+            for another.
+        fusion_foreground_mask_paths (list[str | None] | None): Optional per-view mask paths for
+            streaming TSDF fusion gating. Each entry is either a mask image path or ``None``.
 
     Returns:
         accum_grid (Grid): The accumulated :class:`fvdb.Grid` representing the voxels in the TSDF volume.
@@ -620,91 +731,117 @@ def tsdf_from_splats_dlnr(
         projection_matrices = projection_matrices.clone()
         projection_matrices[:, :2, :] /= image_downsample_factor
 
-    with tempfile.TemporaryDirectory() as cache_path:
-        dataset = TSDFInputDataset(
-            cache_path=pathlib.Path(cache_path),
-            model=model,
-            camera_to_world_matrices=camera_to_world_matrices,
-            projection_matrices=projection_matrices,
-            image_sizes=image_sizes,
-            camera_models=camera_models,
-            distortion_coeffs=distortion_coeffs,
-            baseline=baseline,
-            near=near,
-            far=far,
-            reprojection_threshold=disparity_reprojection_threshold,
-            alpha_threshold=alpha_threshold,
-            dlnr_model=DLNRModel(backbone=dlnr_backbone, device=model.device),
-            use_absolute_baseline=use_absolute_baseline,
-            show_progress=show_progress,
+    cache_path = (
+        pathlib.Path(dlnr_cache_path) if dlnr_cache_path is not None else pathlib.Path("/workspace/tsdf_dlnr_cache")
+    )
+
+    # A populated cache lets a re-run skip DLNR inference entirely, which dominates wall-clock
+    # time. Only construct the (expensive) DLNR model when something is actually missing.
+    cache = SfmCache.get_cache(cache_path, "TSDFInputs", "Cache for TSDF inputs")
+
+    def _cache_has_all_required_inputs() -> bool:
+        num_views = int(camera_to_world_matrices.shape[0])
+        for i in range(num_views):
+            for suffix in ("rgb", "depth", "weight"):
+                try:
+                    cache.read_file(f"{suffix}_{i}")
+                except (FileNotFoundError, ValueError):
+                    return False
+        return True
+
+    if _cache_has_all_required_inputs():
+        print(f"Reusing complete TSDF DLNR cache from {cache_path}.")
+        dlnr_model = None
+    else:
+        print("Generating TSDF inputs with DLNR...")
+        dlnr_model = DLNRModel(backbone=dlnr_backbone, device=model.device)
+
+    dataset = TSDFInputDataset(
+        cache_path=cache_path,
+        model=model,
+        camera_to_world_matrices=camera_to_world_matrices,
+        projection_matrices=projection_matrices,
+        image_sizes=image_sizes,
+        camera_models=camera_models,
+        distortion_coeffs=distortion_coeffs,
+        baseline=baseline,
+        near=near,
+        far=far,
+        reprojection_threshold=disparity_reprojection_threshold,
+        alpha_threshold=alpha_threshold,
+        dlnr_model=dlnr_model,
+        use_absolute_baseline=use_absolute_baseline,
+        show_progress=show_progress,
+        fusion_foreground_mask_paths=fusion_foreground_mask_paths,
+    )
+    print("Done preparing TSDF inputs.")
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers)
+
+    device = model.device
+    # The voxel size is set by dividing the truncation margin by the grid shell thickness.
+    # This ensures that the truncation margin spans 'grid_shell_thickness' number of voxels,
+    # controlling the grid resolution and mesh quality. Adjusting grid_shell_thickness changes
+    # how many voxels fit within the truncation margin, affecting surface detail.
+    voxel_size = truncation_margin / grid_shell_thickness
+    accum_grid = Grid.from_dense(dense_dims=1, ijk_min=0, voxel_size=voxel_size, origin=0.0, device=device)
+    tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    weights = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    colors = torch.zeros((accum_grid.num_voxels, model.num_channels), device=device, dtype=feature_dtype)
+
+    enumerator = tqdm.tqdm(dataloader, unit="imgs", desc="Extracting TSDF") if show_progress else dataloader
+
+    for i, tsdf_input in enumerate(enumerator):
+        cam_to_world_matrix = camera_to_world_matrices[i].to(dtype=torch.float32, device=device)
+        projection_matrix = projection_matrices[i].to(dtype=torch.float32, device=device)
+
+        rgb_image, depth_image, weight_image = tsdf_input
+        if feature_dtype == torch.uint8:
+            rgb_image = (rgb_image * 255).to(feature_dtype)
+        else:
+            rgb_image = rgb_image.to(feature_dtype)
+        depth_image = depth_image.to(dtype)
+        weight_image = weight_image.to(dtype)
+
+        # squeeze(0) drops the DataLoader collation dim; unsqueeze(0) then adds the
+        # fvdb grid-batch dim (1 for a single Grid). fvdb-core expects batched
+        # inputs: projection (B, 3, 3), cam-to-world (B, 4, 4), depth (B, H, W),
+        # features (B, H, W, C), weights (B, H, W).
+        accum_grid, tsdf, weights, colors = accum_grid.integrate_tsdf_with_features(
+            truncation_margin,
+            projection_matrix.to(dtype).unsqueeze(0),
+            cam_to_world_matrix.to(dtype).unsqueeze(0),
+            tsdf,
+            colors,
+            weights,
+            depth_image.squeeze(0).to(device).unsqueeze(0),
+            rgb_image.squeeze(0).to(device).unsqueeze(0),
+            weight_image.squeeze(0).to(device).unsqueeze(0),
         )
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers)
 
-        device = model.device
-        # The voxel size is set by dividing the truncation margin by the grid shell thickness.
-        # This ensures that the truncation margin spans 'grid_shell_thickness' number of voxels,
-        # controlling the grid resolution and mesh quality. Adjusting grid_shell_thickness changes
-        # how many voxels fit within the truncation margin, affecting surface detail.
-        voxel_size = truncation_margin / grid_shell_thickness
-        accum_grid = Grid.from_dense(dense_dims=1, ijk_min=0, voxel_size=voxel_size, origin=0.0, device=device)
-        tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
-        weights = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
-        colors = torch.zeros((accum_grid.num_voxels, model.num_channels), device=device, dtype=feature_dtype)
+        if show_progress:
+            assert isinstance(enumerator, tqdm.tqdm)
+            enumerator.set_postfix({"accumulated_voxels": accum_grid.num_voxels})
 
-        enumerator = tqdm.tqdm(dataloader, unit="imgs", desc="Extracting TSDF") if show_progress else dataloader
-
-        for i, tsdf_input in enumerate(enumerator):
-            cam_to_world_matrix = camera_to_world_matrices[i].to(dtype=torch.float32, device=device)
-            projection_matrix = projection_matrices[i].to(dtype=torch.float32, device=device)
-
-            rgb_image, depth_image, weight_image = tsdf_input
-            if feature_dtype == torch.uint8:
-                rgb_image = (rgb_image * 255).to(feature_dtype)
-            else:
-                rgb_image = rgb_image.to(feature_dtype)
-            depth_image = depth_image.to(dtype)
-            weight_image = weight_image.to(dtype)
-
-            # squeeze(0) drops the DataLoader collation dim; unsqueeze(0) then adds the
-            # fvdb grid-batch dim (1 for a single Grid). fvdb-core expects batched
-            # inputs: projection (B, 3, 3), cam-to-world (B, 4, 4), depth (B, H, W),
-            # features (B, H, W, C), weights (B, H, W).
-            accum_grid, tsdf, weights, colors = accum_grid.integrate_tsdf_with_features(
-                truncation_margin,
-                projection_matrix.to(dtype).unsqueeze(0),
-                cam_to_world_matrix.to(dtype).unsqueeze(0),
-                tsdf,
-                colors,
-                weights,
-                depth_image.squeeze(0).to(device).unsqueeze(0),
-                rgb_image.squeeze(0).to(device).unsqueeze(0),
-                weight_image.squeeze(0).to(device).unsqueeze(0),
-            )
-
-            if show_progress:
-                assert isinstance(enumerator, tqdm.tqdm)
-                enumerator.set_postfix({"accumulated_voxels": accum_grid.num_voxels})
-
-            # Prune out zero weight voxels to save memory
-            new_grid = accum_grid.pruned_grid(weights > 0.0)
-            tsdf = new_grid.inject_from(accum_grid, tsdf)
-            colors = new_grid.inject_from(accum_grid, colors)
-            weights = new_grid.inject_from(accum_grid, weights)
-            accum_grid = new_grid
-
-            # TSDF fusion is a bit of a torture case for the PyTorch memory allocator since
-            # it progressively allocates bigger tensors which don't fit in the memory pool,
-            # causing the pool to grow larger and larger.
-            # To avoid this, we synchronize the CUDA device and empty the cache after each image.
-            del rgb_image, depth_image, weight_image
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-        # After integrating all the images, we prune the grid to remove empty voxels which have no weights.
-        # This is done to reduce the size of the grid and speed up the marching cubes algorithm
-        # which will be used to extract the mesh.
+        # Prune out zero weight voxels to save memory
         new_grid = accum_grid.pruned_grid(weights > 0.0)
-        filter_tsdf = new_grid.inject_from(accum_grid, tsdf)
-        filter_colors = new_grid.inject_from(accum_grid, colors)
+        tsdf = new_grid.inject_from(accum_grid, tsdf)
+        colors = new_grid.inject_from(accum_grid, colors)
+        weights = new_grid.inject_from(accum_grid, weights)
+        accum_grid = new_grid
+
+        # TSDF fusion is a bit of a torture case for the PyTorch memory allocator since
+        # it progressively allocates bigger tensors which don't fit in the memory pool,
+        # causing the pool to grow larger and larger.
+        # To avoid this, we synchronize the CUDA device and empty the cache after each image.
+        del rgb_image, depth_image, weight_image
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    # After integrating all the images, we prune the grid to remove empty voxels which have no weights.
+    # This is done to reduce the size of the grid and speed up the marching cubes algorithm
+    # which will be used to extract the mesh.
+    new_grid = accum_grid.pruned_grid(weights > 0.0)
+    filter_tsdf = new_grid.inject_from(accum_grid, tsdf)
+    filter_colors = new_grid.inject_from(accum_grid, colors)
 
     return new_grid, filter_tsdf, filter_colors
