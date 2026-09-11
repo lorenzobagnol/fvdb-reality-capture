@@ -802,6 +802,16 @@ def tsdf_from_splats_dlnr(
         depth_image = depth_image.to(dtype)
         weight_image = weight_image.to(dtype)
 
+        # Zero the depth wherever the fusion weight is zero. integrate_tsdf_with_features sizes
+        # its voxel allocation from the depth image itself, so a pixel that fusion will ignore
+        # still expands the grid if it carries a garbage depth. Measured on pilastro: one view
+        # held a raw depth of 1.7e7 in a ~10-unit scene (DLNR produces such values in pixels the
+        # occlusion/alpha masks then reject), and the integrator requested 27-30 GiB and aborted.
+        # It failed at that same view on both fvdb 0.5 and 0.6, with ~19 GiB still free, and was
+        # unaffected by truncation_margin and grid_shell_thickness - which is exactly what made it
+        # look like a library memory-management bug rather than bad input data.
+        depth_image = torch.where(weight_image > 0, depth_image, torch.zeros_like(depth_image))
+
         # squeeze(0) drops the DataLoader collation dim; unsqueeze(0) then adds the
         # fvdb grid-batch dim (1 for a single Grid). fvdb-core expects batched
         # inputs: projection (B, 3, 3), cam-to-world (B, 4, 4), depth (B, H, W),
