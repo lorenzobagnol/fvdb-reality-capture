@@ -204,6 +204,15 @@ def tsdf_from_splats(
             weight_images = ((depth_images > near_i) & (depth_images < far_i) & alpha_mask).to(dtype).squeeze(0)
         else:
             weight_images = ((depth_images > near_i) & (depth_images < far_i)).to(dtype).squeeze(0)
+
+        # Zero the depth wherever the fusion weight is zero. The weights above already exclude
+        # pixels outside [near, far], but integrate_tsdf_with_features sizes its voxel
+        # allocation by unprojecting the depth image, and that unprojection ignores the
+        # weights -- so an out-of-range depth still expands the grid even though it will never
+        # contribute a sample. Rendered depth is unbounded here (far=1e10 at render time), so a
+        # single stray splat behind the camera plane is enough to blow the allocation up.
+        depth_images = torch.where(weight_images > 0, depth_images, torch.zeros_like(depth_images))
+
         # fvdb-core's TSDF integration expects a leading batch dimension whose size
         # matches the grid batch size (1 for a single Grid): projection (B, 3, 3),
         # cam-to-world (B, 4, 4), depth (B, H, W), features (B, H, W, C), weights

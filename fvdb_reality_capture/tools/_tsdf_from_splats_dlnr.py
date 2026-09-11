@@ -665,6 +665,16 @@ def tsdf_from_splats_dlnr(
             depth_image = depth_image.to(dtype)
             weight_image = weight_image.to(dtype)
 
+            # Zero the depth wherever the fusion weight is zero. integrate_tsdf_with_features
+            # sizes its voxel allocation by unprojecting the depth image, and that unprojection
+            # ignores the weights -- so a pixel fusion will discard anyway still expands the
+            # grid if it carries a garbage depth. DLNR routinely emits such depths in the
+            # low-confidence regions the alpha/reprojection masks already reject: on one
+            # 370-view scene a single view held a raw depth of 1.7e7 in a ~10-unit scene,
+            # which blew the grid up to an out-of-memory abort at view 363 while using only
+            # 5.3 GB of the 24 GB of VRAM available.
+            depth_image = torch.where(weight_image > 0, depth_image, torch.zeros_like(depth_image))
+
             # squeeze(0) drops the DataLoader collation dim; unsqueeze(0) then adds the
             # fvdb grid-batch dim (1 for a single Grid). fvdb-core expects batched
             # inputs: projection (B, 3, 3), cam-to-world (B, 4, 4), depth (B, H, W),
