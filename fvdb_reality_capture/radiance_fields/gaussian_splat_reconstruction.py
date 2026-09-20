@@ -234,12 +234,86 @@ class GaussianSplatReconstructionConfig:
     Default: ``0.0`` (no sparse depth loss).
     """
 
+    sparse_alpha_reg: float = 0.0
+    """
+    Weight for an opacity term at the sparse depth pixels: ``mean(1 - alpha)`` over the pixels of the SfM points
+    visible in the image. SfM points lie on opaque surfaces by construction, and the sparse depth loss compares
+    ``depth / alpha``, which a faint layer at the right depth satisfies without rendering a surface. Default: ``0.0``.
+    """
+
+    interp_depth_reg: float = 0.0
+    """
+    Weight for the interpolated sparse depth loss. The sparse depth loss (:attr:`sparse_depth_reg`) only constrains the
+    pixels where an SfM point exists; a textureless surface with the same colour as whatever lies behind it can lose a
+    whole patch between those points without any photometric or depth gradient noticing. This term fills the gap: the
+    SfM points of each image are Delaunay-triangulated in image space, triangles whose three depths agree to within
+    :attr:`interp_depth_planarity` (i.e. that do not straddle a depth discontinuity) are kept, and the rendered depth
+    is supervised at pixels sampled inside them against the inverse-depth interpolation of the vertices, which is
+    exact for a plane. Same L1-on-median-normalised-depth form as the sparse term. Default: ``0.0`` (off).
+    """
+
+    interp_depth_planarity: float = 0.03
+    """
+    For :attr:`interp_depth_reg`: a triangle is used only if its three SfM points lie on the same locally fitted
+    plane. Each point gets a plane from its ``interp_depth_plane_k`` nearest visible SfM points (camera space);
+    the point is reliable if the fit residual is below ``interp_depth_planarity`` times the image's median depth,
+    and a triangle is accepted if all three vertices are reliable, their normals agree within
+    ``interp_depth_normal_cos`` and each vertex lies within the same tolerance of the other vertices' planes.
+    This is what stops a triangle spanning a wall and a nearer feature at similar depth from pulling the wall
+    forward. Default: ``0.03``.
+    """
+
+    interp_depth_plane_k: int = 12
+    """Number of nearest visible SfM points used to fit each point's local plane. Default: ``12``."""
+
+    interp_depth_normal_cos: float = 0.97
+    """Minimum cosine between the three vertex-plane normals of an accepted triangle. Default: ``0.97`` (~14 deg)."""
+
+    interp_depth_max_edge: float = 0.35
+    """
+    Maximum triangle edge length for :attr:`interp_depth_reg`, as a fraction of the image width. Guards against a
+    few far-apart points spanning unrelated regions. Default: ``0.35``.
+    """
+
+    interp_depth_samples: int = 8192
+    """
+    Number of pixels sampled per step inside the accepted triangles for :attr:`interp_depth_reg`. Default: ``8192``.
+    """
+
+    interp_depth_max_rel_error: float = 0.5
+    """
+    Truncation for :attr:`interp_depth_reg`: a sampled pixel contributes only if the rendered surface there has
+    alpha > 0.5 and its depth is within this relative distance of the interpolated depth. Image-space triangles do
+    not know about empty space, so without this a far background seen between two foreground points at equal depth
+    would be pulled onto a phantom plane; the back of a gap in a thin wall (a few percent deeper) stays in range.
+    Default: ``0.5``.
+    """
+
     dense_depth_attribute: str | None = None
     """
     Name of a :class:`~fvdb_reality_capture.sfm_scene.DepthMapAttribute` registered on the scene to use as a
     per-pixel ground-truth depth target. If ``None`` and :attr:`dense_depth_reg` is non-zero, a ``ValueError`` is raised.
 
     Default: ``None`` (no dense depth supervision).
+    """
+
+    depth_smoothness_reg: float = 0.0
+    """
+    Weight on an edge-aware curvature penalty on the rendered inverse depth.
+
+    Textureless surfaces are geometrically unconstrained during optimization: the photometric loss
+    has no depth gradient where the image has no gradient, and the sparse depth loss cannot help
+    because SfM triangulates no points there. The wall is free to undulate, and does -- measured on
+    one scene, a ripple of ~0.017 scene units at a ~0.15 unit wavelength, present in every fused mesh.
+
+    This penalizes the second finite difference of the rendered inverse depth, weighted by
+    ``exp(-|grad I| / 0.01)`` computed on the ground-truth pixels, so the penalty is full where the
+    image is flat and vanishes across real edges. Inverse depth is used because it is linear in pixel
+    coordinates for a plane under perspective, so an oblique plane costs nothing -- only curvature
+    does. The term is normalized by the per-image median inverse depth and is therefore scene-scale
+    independent.
+
+    Default: ``0.0`` (disabled).
     """
 
     dense_depth_reg: float = 0.0
@@ -860,7 +934,7 @@ class GaussianSplatReconstruction:
         self._training_dataset = SfmDataset(
             sfm_scene=sfm_scene,
             dataset_indices=train_indices,
-            return_visible_points=(self.config.sparse_depth_reg > 0.0),
+            return_visible_points=(self.config.sparse_depth_reg > 0.0 or self.config.interp_depth_reg > 0.0),
             load_attributes=dense_depth_load,
             cache_images=self.config.cache_training_images,
         )
@@ -1259,6 +1333,120 @@ class GaussianSplatReconstruction:
             f"Clipped {num_clipped_gaussians:,} Gaussians outside the crop bounding box min={bbox_min}, max={bbox_max}."
         )
 
+    def _interpolated_sparse_depth(
+        self,
+        uv: torch.Tensor,
+        z: torch.Tensor,
+        projection: torch.Tensor,
+        median_depth: torch.Tensor,
+        image_width: int,
+        image_height: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """
+        Densify one image's sparse SfM depths across locally planar regions, for :attr:`Config.interp_depth_reg`.
+
+        The visible SfM points are lifted to camera space and each gets a plane fitted to its nearest
+        neighbours. The point pixels are Delaunay-triangulated; a triangle is kept only when its three
+        vertices are reliably planar, share a normal and lie on each other's planes -- i.e. when the
+        three points belong to one flat surface, so that continuing that surface across the triangle is
+        justified. Pixels are sampled inside the kept triangles (area-weighted, uniform barycentric) and
+        the target depth is the intersection of the pixel ray with the mean vertex plane.
+
+        Args:
+            uv: ``[N, 2]`` integer pixel coordinates (x, y) of the SfM points visible in the image.
+            z: ``[N]`` their depths.
+            projection: ``[3, 3]`` camera intrinsics for this image.
+            median_depth: scalar median depth of the image, sets the planarity tolerances.
+            image_width: Width of the image in pixels.
+            image_height: Height of the image in pixels.
+
+        Returns:
+            ``(pixels [M, 2] long, depths [M])`` on the model device, or ``(None, None)`` when no
+            triangle survives the gates.
+        """
+        from scipy.spatial import Delaunay, cKDTree  # local import: only needed when the term is on
+
+        uv_np = uv.detach().cpu().numpy().astype(np.float64)
+        z_np = z.detach().cpu().numpy().astype(np.float64)
+        K = projection.detach().cpu().numpy().astype(np.float64)
+        med = float(median_depth)
+        k = int(self.config.interp_depth_plane_k)
+        if len(uv_np) < max(k + 1, 8) or np.ptp(uv_np[:, 0]) < 1 or np.ptp(uv_np[:, 1]) < 1 or med <= 0:
+            return None, None
+        # camera-space points and per-point local planes
+        Kinv = np.linalg.inv(K)
+        rays = (Kinv @ np.c_[uv_np, np.ones(len(uv_np))].T).T  # [N, 3], z = 1
+        X = rays * z_np[:, None]
+        _, nn = cKDTree(X).query(X, k=k + 1)
+        nb = X[nn]  # [N, k+1, 3]
+        c = nb.mean(1, keepdims=True)
+        _, sv, vt = np.linalg.svd(nb - c, full_matrices=False)
+        normals = vt[:, 2, :]  # [N, 3]
+        offsets = -(normals * c[:, 0, :]).sum(1)  # plane: n.X + d = 0
+        resid = sv[:, 2] / np.sqrt(k + 1)  # rms distance of the neighbours from the plane
+        tol = self.config.interp_depth_planarity * med
+        reliable = resid < tol
+        # triangles
+        try:
+            tri = Delaunay(uv_np).simplices  # [T, 3]
+        except Exception:
+            return None, None
+        keep = reliable[tri].all(1)
+        n_t = normals[tri]  # [T, 3, 3]
+        cos01 = np.abs((n_t[:, 0] * n_t[:, 1]).sum(1))
+        cos12 = np.abs((n_t[:, 1] * n_t[:, 2]).sum(1))
+        cos20 = np.abs((n_t[:, 2] * n_t[:, 0]).sum(1))
+        keep &= np.minimum(np.minimum(cos01, cos12), cos20) > self.config.interp_depth_normal_cos
+        # each vertex must lie on the other vertices' planes
+        Xt = X[tri]  # [T, 3, 3]
+        for i in range(3):
+            for j in range(3):
+                if i != j:
+                    keep &= np.abs((n_t[:, i] * Xt[:, j]).sum(1) + offsets[tri[:, i]]) < tol
+        p = uv_np[tri]
+        e = np.stack(
+            [
+                np.linalg.norm(p[:, 0] - p[:, 1], axis=1),
+                np.linalg.norm(p[:, 1] - p[:, 2], axis=1),
+                np.linalg.norm(p[:, 2] - p[:, 0], axis=1),
+            ],
+            1,
+        ).max(1)
+        keep &= e < self.config.interp_depth_max_edge * image_width
+        if not keep.any():
+            return None, None
+        tri, p, n_t = tri[keep], p[keep], n_t[keep]
+        # mean plane per triangle (normals oriented consistently, then averaged)
+        sgn = np.sign((n_t * n_t[:, :1, :]).sum(2))[:, :, None]
+        sgn[sgn == 0] = 1
+        n_mean = (n_t * sgn).mean(1)
+        n_mean /= np.maximum(np.linalg.norm(n_mean, axis=1, keepdims=True), 1e-12)
+        d_mean = -(n_mean * Xt[keep].mean(1)).sum(1)
+        area = 0.5 * np.abs(
+            (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - (p[:, 2, 0] - p[:, 0, 0]) * (p[:, 1, 1] - p[:, 0, 1])
+        )
+        if area.sum() <= 0:
+            return None, None
+        rng = np.random.default_rng()
+        m = int(self.config.interp_depth_samples)
+        pick = rng.choice(len(tri), size=m, p=area / area.sum())
+        r1, r2 = rng.random(m), rng.random(m)
+        s1 = np.sqrt(r1)
+        w = np.stack([1.0 - s1, s1 * (1.0 - r2), s1 * r2], 1)  # uniform barycentric sampling
+        pix = (w[:, :, None] * p[pick]).sum(1)
+        px = np.clip(np.rint(pix[:, 0]), 0, image_width - 1).astype(np.int64)
+        py = np.clip(np.rint(pix[:, 1]), 0, image_height - 1).astype(np.int64)
+        # ray-plane intersection: X = t * r, n.X + d = 0 -> t = -d / (n.r); depth = t (r has z = 1)
+        r = (Kinv @ np.c_[px, py, np.ones(m)].T).T
+        denom = (n_mean[pick] * r).sum(1)
+        ok = np.abs(denom) > 1e-6
+        depth = np.where(ok, -d_mean[pick] / np.where(ok, denom, 1.0), np.nan)
+        ok &= np.isfinite(depth) & (depth > 0)
+        if ok.sum() < 16:
+            return None, None
+        pixels = torch.from_numpy(np.stack([px[ok], py[ok]], 1)).to(self.device)
+        return pixels, torch.from_numpy(depth[ok]).to(self.device, dtype=torch.float32)
+
     def optimize(self, show_progress: bool = True, log_tag: str = "reconstruct") -> None:
         """
         Run the reconstruction optimization loop to optimize reconstruct a Gaussian Splatting radiance field from a set of posed images.
@@ -1463,8 +1651,40 @@ class GaussianSplatReconstruction:
 
                             depth_loss = nnf.l1_loss(pred_depth, sparse_depth) * self.config.sparse_depth_reg
                             loss = loss + depth_loss
+                            if self.config.sparse_alpha_reg > 0.0:
+                                loss = loss + (1.0 - alpha_uv).mean() * self.config.sparse_alpha_reg
                     else:
                         depth_loss = 0.0
+
+                    # Interpolated sparse depth loss: supervise the depth between the SfM points, on
+                    # triangles that do not straddle a depth discontinuity (see the config docstring).
+                    if (
+                        self.config.interp_depth_reg > 0.0
+                        and sparse_depth is not None
+                        and sparse_depth_uv is not None
+                        and median_depths is not None
+                        and sparse_depth_uv.numel() >= 6
+                    ):
+                        if render_outputs.depth is None:
+                            raise RuntimeError("Model did not render depth channel, but interp depth loss is enabled.")
+                        interp_uv, interp_z = self._interpolated_sparse_depth(
+                            sparse_depth_uv[0], sparse_depth[0], projection_mats[0], median_depths[0],
+                            image_width, image_height,
+                        )
+                        if interp_uv is not None:
+                            depth = render_outputs.depth[..., 0]  # [1, H, W]
+                            d_i = depth[:, interp_uv[:, 1], interp_uv[:, 0]]  # [1, M]
+                            a_i = render_outputs.alpha[:, interp_uv[:, 1], interp_uv[:, 0], 0]  # [1, M]
+                            pred_i = d_i / torch.clamp(a_i, min=1e-6) / median_depths.unsqueeze(1)
+                            tgt_i = interp_z.unsqueeze(0) / median_depths.unsqueeze(1)
+                            # Only where a surface is rendered and it is plausibly the one the points lie on.
+                            valid_i = (a_i > 0.5) & (
+                                (pred_i - tgt_i).abs() < self.config.interp_depth_max_rel_error * tgt_i
+                            )
+                            if valid_i.any():
+                                loss = loss + (
+                                    (pred_i - tgt_i).abs()[valid_i].mean() * self.config.interp_depth_reg
+                                )
 
                     # Dense depth loss (from a DepthMapAttribute on the scene).
                     if dense_depth_tgt is not None and self.config.dense_depth_reg > 0.0:
@@ -1494,6 +1714,31 @@ class GaussianSplatReconstruction:
                         loss = loss + dense_depth_loss
                     else:
                         dense_depth_loss = 0.0
+
+                    # Edge-aware curvature penalty on inverse depth (see config docstring).
+                    if self.config.depth_smoothness_reg > 0.0:
+                        if render_outputs.depth is None:
+                            raise RuntimeError(
+                                "Model did not render depth channel, but depth smoothness loss is enabled."
+                            )
+                        alpha_s = render_outputs.alpha[..., 0]  # [B, h, w]
+                        depth_s = render_outputs.depth[..., 0] / torch.clamp(alpha_s, min=1e-6)
+                        inv = 1.0 / torch.clamp(depth_s, min=1e-6)
+                        inv = inv / torch.clamp(inv.flatten(1).median(dim=1).values, min=1e-9).view(-1, 1, 1)
+                        # second differences along each image axis
+                        dxx = inv[:, :, 2:] - 2.0 * inv[:, :, 1:-1] + inv[:, :, :-2]
+                        dyy = inv[:, 2:, :] - 2.0 * inv[:, 1:-1, :] + inv[:, :-2, :]
+                        # image gradient from the ground truth, so the weights cannot be gamed by the render
+                        gray = pixels.mean(dim=-1)  # [B, h, w]
+                        gx = torch.abs(gray[:, :, 2:] - gray[:, :, :-2])
+                        gy = torch.abs(gray[:, 2:, :] - gray[:, :-2, :])
+                        wx = torch.exp(-gx / 0.01) * alpha_s[:, :, 1:-1].detach()
+                        wy = torch.exp(-gy / 0.01) * alpha_s[:, 1:-1, :].detach()
+                        smooth_loss = (
+                            (torch.abs(dxx) * wx).sum() / wx.sum().clamp(min=1.0)
+                            + (torch.abs(dyy) * wy).sum() / wy.sum().clamp(min=1.0)
+                        ) * self.config.depth_smoothness_reg
+                        loss = loss + smooth_loss
 
                     # If you're optimizing poses, regularize the pose parameters so the poses
                     # don't drift too far from the initial values

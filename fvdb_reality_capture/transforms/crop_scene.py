@@ -18,6 +18,20 @@ from fvdb_reality_capture.sfm_scene import SfmCache, SfmPosedImageMetadata, SfmS
 from .base_transform import BaseTransform, transform
 
 
+def _existing_mask_fingerprint(input_scene: SfmScene) -> str:
+    """Short hash of (path, size, mtime) of every existing per-image mask, '' when there are none."""
+    import hashlib
+    h = hashlib.sha1(); any_mask = False
+    for image_meta in input_scene.images:
+        mask_path = getattr(image_meta, "mask_path", None)
+        if mask_path and os.path.exists(mask_path):
+            st = os.stat(mask_path); any_mask = True
+            h.update(f"{mask_path}:{st.st_size}:{int(st.st_mtime)}".encode())
+        else:
+            h.update(b"none")
+    return h.hexdigest()[:10] if any_mask else ""
+
+
 def _crop_scene_to_bbox(
     input_scene: SfmScene,
     transform_name: str,
@@ -33,6 +47,13 @@ def _crop_scene_to_bbox(
     output_cache_prefix = output_cache_prefix.replace(" ", "_")  # Ensure no spaces in the cache prefix
     output_cache_prefix = output_cache_prefix.replace(".", "_")  # Ensure no dots in the cache prefix
     output_cache_prefix = output_cache_prefix.replace("-", "neg")  # Ensure no dashes in the cache prefix
+    # The cache key must also cover the masks being composited in: they are inputs. Otherwise a
+    # dataset that gains (or changes) its masks after a first run keeps reusing crop masks that
+    # never saw them, and every downstream consumer of mask_path silently runs unmasked.
+    if composite_with_existing_masks:
+        fp = _existing_mask_fingerprint(input_scene)
+        if fp:
+            output_cache_prefix = f"{output_cache_prefix}_m{fp}"
 
     input_cache: SfmCache = input_scene.cache
 

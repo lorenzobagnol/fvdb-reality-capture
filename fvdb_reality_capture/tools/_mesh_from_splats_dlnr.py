@@ -34,6 +34,14 @@ def mesh_from_splats_dlnr(
     num_workers: int = 8,
     dlnr_cache_path: str | None = None,
     fusion_foreground_mask_paths: list[str | None] | None = None,
+    fusion_reference_depths=None,
+    rendered_depth_fallback: float = 0.0,
+    warm_start_from_render: bool = False,
+    dlnr_iters: int = 10,
+    vpp_density: float = 0.0,
+    vpp_alpha: float = 0.4,
+    vpp_texture_quantile: float = 0.5,
+    min_voxel_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract a triangle mesh from a :class:`fvdb_reality_capture.GaussianSplat3d` using TSDF fusion from depth maps predicted from the Gaussian splat radiance field and the
@@ -127,6 +135,10 @@ def mesh_from_splats_dlnr(
             :func:`fvdb_reality_capture.tools.tsdf_from_splats_dlnr` is used. Reusing a populated
             cache skips DLNR inference entirely; use a per-dataset path, since a cache from one
             scene is silently reused for another if the path is shared.
+        rendered_depth_fallback (float): Relative tolerance for preferring DLNR's depth over the
+            splat's own rendered depth. Where the two differ by more than this fraction, the
+            rendered depth is fused instead of dropping the pixel, which fills the holes stereo
+            matching leaves on untextured surfaces. 0 disables the fallback.
         fusion_foreground_mask_paths (list[str | None] | None): Optional per-view mask paths for
             streaming TSDF fusion gating. Each entry is either a filesystem path to a mask image or
             ``None`` (no gating for that view). When provided, masks are loaded per view during TSDF
@@ -162,6 +174,14 @@ def mesh_from_splats_dlnr(
         dlnr_backbone=dlnr_backbone,
         dlnr_cache_path=dlnr_cache_path,
         fusion_foreground_mask_paths=fusion_foreground_mask_paths,
+        fusion_reference_depths=fusion_reference_depths,
+        rendered_depth_fallback=rendered_depth_fallback,
+        warm_start_from_render=warm_start_from_render,
+        dlnr_iters=dlnr_iters,
+        vpp_density=vpp_density,
+        vpp_alpha=vpp_alpha,
+        vpp_texture_quantile=vpp_texture_quantile,
+        min_voxel_weight=min_voxel_weight,
         use_absolute_baseline=use_absolute_baseline,
         show_progress=show_progress,
         num_workers=num_workers,

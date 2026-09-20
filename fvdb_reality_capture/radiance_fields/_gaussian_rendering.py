@@ -16,7 +16,12 @@ if TYPE_CHECKING:
 
 
 def _needs_depth_render(config: "GaussianSplatReconstructionConfig") -> bool:
-    return config.sparse_depth_reg > 0.0 or config.dense_depth_reg > 0.0
+    return (
+        config.sparse_depth_reg > 0.0
+        or config.dense_depth_reg > 0.0
+        or config.interp_depth_reg > 0.0
+        or config.depth_smoothness_reg > 0.0
+    )
 
 
 @dataclass

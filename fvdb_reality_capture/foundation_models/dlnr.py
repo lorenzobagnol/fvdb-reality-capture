@@ -73,7 +73,13 @@ class DLNRModel:
         self._logger.info("DLNR model loaded successfully.")
 
     def predict_flow(
-        self, images1: torch.Tensor, images2: torch.Tensor, iters=10, flow_init=None, return_unpadded=False
+        self,
+        images1: torch.Tensor,
+        images2: torch.Tensor,
+        iters=10,
+        flow_init=None,
+        return_unpadded=False,
+        disparity_init: torch.Tensor | None = None,
     ):
         """
         Compute optical flow and disparity between two batches of images using DLNR.
@@ -82,7 +88,12 @@ class DLNRModel:
             images1 (torch.Tensor): First batch of images, shape [B, H, W, C] (channels last) normalized in the range [0, 1].
             images2 (torch.Tensor): Second batch of images, shape [B, H, W, C] (channels last) normalized in the range [0, 1].
             iters (int): Number of iterations for the DLNR model to run. Defaults to 10.
-            flow_init (torch.Tensor, optional): Initial flow estimate, shape [B, 2, H, W]. Defaults to None.
+            flow_init (torch.Tensor, optional): Initial flow estimate, at the model's internal
+                resolution (1/2**n_downsample) and in that scale's units. Defaults to None.
+            disparity_init (torch.Tensor, optional): Full-resolution positive disparity, shape
+                [B, H, W], to warm-start the refinement from. Converted internally to ``flow_init``
+                (padded, downsampled and rescaled). Takes precedence over ``flow_init``. Use this to
+                seed the matcher where the images carry no texture to match on.
             return_unpadded (bool):
                 If True, returns the unpadded flow and disparity. Defaults to False. _i.e._ When False, the input
                 is padded to a shape compatible with the DLNR model, and the output is unpadded to match the original input shape.
@@ -108,6 +119,37 @@ class DLNRModel:
         images2 = images2.contiguous()
         padder = InputPadder(images1.shape, divis_by=32)
         image1_padded, image2_padded = padder.pad(images1, images2)
+
+        # Warm-start the iterative refinement from a known disparity.
+        #
+        # DLNR refines from an initial guess, and with no guess it starts at zero. Where the image
+        # has texture the correlation volume pulls it to the right match within a few iterations;
+        # where it does not -- a blank wall -- there is nothing to pull it, so it stays near zero
+        # and the depth derived from it (fx*baseline/disparity) comes out far too large. Measured on
+        # pilastro, that biases flat regions +18.7% in depth against +8.3% on textured edges, which
+        # is what makes walls look sunken relative to the object's edges.
+        #
+        # Seeding the iteration with the disparity implied by the splat's own rendered depth fixes
+        # the failure at its source: textured regions still refine away from the seed as before,
+        # while untextured ones keep the splat's geometry instead of collapsing toward zero.
+        #
+        # The model adds flow_init to `coords1`, which lives at 1/2**n_downsample resolution (4 here)
+        # and in that scale's pixel units, and it is applied after padding -- so the seed is padded
+        # with the same padder, downsampled, and its magnitude divided by the same factor. The sign
+        # is negative because callers negate the returned disparity.
+        if disparity_init is not None:
+            if disparity_init.dim() != 3:
+                raise ValueError("disparity_init must have shape [B, H, W].")
+            factor = 2**self._DLNR_model.args.n_downsample
+            seed = -disparity_init.unsqueeze(1).to(images1.dtype)  # [B, 1, H, W]
+            seed = padder.pad(seed, seed)[0]
+            seed = (
+                torch.nn.functional.interpolate(
+                    seed, scale_factor=1.0 / factor, mode="bilinear", align_corners=False
+                )
+                / factor
+            )
+            flow_init = torch.cat([seed, torch.zeros_like(seed)], dim=1)  # [B, 2, h/4, w/4]
 
         flow, disparity = self._DLNR_model(
             image1_padded, image2_padded, iters=iters, flow_init=flow_init, test_mode=True

@@ -204,7 +204,7 @@ class DownsampleImages(BaseTransform):
             for _, image_meta in enumerate(pbar):
                 image_filename = pathlib.Path(image_meta.image_path).name
                 full_res_image_path = image_meta.image_path
-                full_res_img = cv2.imread(full_res_image_path)
+                full_res_img = cv2.imread(full_res_image_path, cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)  # raw pixel frame, as COLMAP
                 assert full_res_img is not None, f"Failed to load image {full_res_image_path}"
                 img_h, img_w = full_res_img.shape[:2]
                 rescaled_img_h = int(img_h / self._image_downsample_factor)
